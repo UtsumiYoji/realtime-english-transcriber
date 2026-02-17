@@ -1,0 +1,29 @@
+# DeepL API key (Free plan)
+# Get your key at: https://www.deepl.com/pro#developer
+deepl_api_key: ""
+
+# Whisper model size: tiny, base, small, medium (multilingual)
+#   or tiny.en, base.en, small.en (English-only, no language detection)
+whisper_model: "base"
+
+# Whisper compute type: int8, float32
+compute_type: "int8"
+
+# Enable translation by default
+translation_enabled: true
+
+# Auto-save file path (empty = disabled)
+# Example: "C:/Users/YourName/Documents/transcripts/"
+auto_save_path: ""
+
+# Default audio device name (empty = system default)
+default_device: ""
+
+# VAD sensitivity threshold (0.0 - 1.0, higher = stricter)
+vad_threshold: 0.5
+
+# Maximum speech duration before forced flush (seconds)
+max_speech_duration: 30.0
+
+# Minimum speech duration to process (milliseconds)
+min_speech_ms: 250
