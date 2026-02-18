@@ -48,9 +48,16 @@ class TranscriberApp:
     def __init__(self, config: AppConfig) -> None:
         self._config = config
 
-        # Core components
-        self._audio_capture = AudioCapture()
-        self._vad = VoiceActivityDetector(
+        # Core components — two capture instances for output and mic
+        self._audio_capture_output = AudioCapture(source_tag="output")
+        self._audio_capture_mic = AudioCapture(source_tag="mic")
+        # Per-source VAD instances to handle simultaneous speech independently
+        self._vad_output = VoiceActivityDetector(
+            threshold=config.vad_threshold,
+            min_speech_ms=config.min_speech_ms,
+            max_speech_s=config.max_speech_duration,
+        )
+        self._vad_mic = VoiceActivityDetector(
             threshold=config.vad_threshold,
             min_speech_ms=config.min_speech_ms,
             max_speech_s=config.max_speech_duration,
@@ -63,7 +70,8 @@ class TranscriberApp:
         self._file_exporter = FileExporter()
 
         # Queues for inter-thread communication
-        self._audio_queue: Queue[np.ndarray] = Queue(maxsize=AUDIO_QUEUE_MAX)
+        # audio_queue now carries (source_tag, chunk) tuples
+        self._audio_queue: Queue[tuple[str, np.ndarray]] = Queue(maxsize=AUDIO_QUEUE_MAX)
         self._text_queue: Queue[TranscriptEntry] = Queue(maxsize=TEXT_QUEUE_MAX)
         self._display_queue: Queue[TranscriptEntry] = Queue(maxsize=DISPLAY_QUEUE_MAX)
 
@@ -73,7 +81,8 @@ class TranscriberApp:
         self._translation_thread: threading.Thread | None = None
 
         # State
-        self._devices: list[AudioDevice] = []
+        self._output_devices: list[AudioDevice] = []
+        self._input_devices: list[AudioDevice] = []
         self._entries: list[TranscriptEntry] = []
         self._is_recording = False
 
@@ -85,31 +94,50 @@ class TranscriberApp:
         """Construct the Tkinter UI."""
         root = self._root
         root.title("Realtime English Transcriber")
-        root.geometry("800x600")
-        root.minsize(600, 400)
+        root.geometry("900x650")
+        root.minsize(700, 450)
 
-        # --- Top control bar ---
-        control_frame = ttk.Frame(root, padding=5)
-        control_frame.pack(fill=tk.X)
+        # Sentinel value for disabled device selection
+        self._disabled_label = "(無効)"
 
-        # Audio device selection
-        ttk.Label(control_frame, text="Audio Device:").pack(side=tk.LEFT, padx=(0, 5))
-        self._device_var = tk.StringVar()
-        self._device_combo = ttk.Combobox(
-            control_frame,
-            textvariable=self._device_var,
+        # --- Top control bar: device selection ---
+        device_frame = ttk.Frame(root, padding=5)
+        device_frame.pack(fill=tk.X)
+
+        # Output device selection
+        ttk.Label(device_frame, text="🔊 Output:").pack(side=tk.LEFT, padx=(0, 3))
+        self._output_device_var = tk.StringVar()
+        self._output_device_combo = ttk.Combobox(
+            device_frame,
+            textvariable=self._output_device_var,
             state="readonly",
-            width=40,
+            width=30,
         )
-        self._device_combo.pack(side=tk.LEFT, padx=(0, 5))
+        self._output_device_combo.pack(side=tk.LEFT, padx=(0, 10))
+        self._output_device_combo.bind("<<ComboboxSelected>>", lambda _: self._update_start_btn_state())
+
+        # Mic device selection
+        ttk.Label(device_frame, text="🎤 Mic:").pack(side=tk.LEFT, padx=(0, 3))
+        self._mic_device_var = tk.StringVar()
+        self._mic_device_combo = ttk.Combobox(
+            device_frame,
+            textvariable=self._mic_device_var,
+            state="readonly",
+            width=30,
+        )
+        self._mic_device_combo.pack(side=tk.LEFT, padx=(0, 10))
+        self._mic_device_combo.bind("<<ComboboxSelected>>", lambda _: self._update_start_btn_state())
 
         # Refresh devices button
         self._refresh_btn = ttk.Button(
-            control_frame, text="🔄", width=3, command=self._refresh_devices
+            device_frame, text="🔄", width=3, command=self._refresh_devices
         )
-        self._refresh_btn.pack(side=tk.LEFT, padx=(0, 10))
+        self._refresh_btn.pack(side=tk.LEFT, padx=(0, 5))
 
-        # Start / Stop buttons
+        # --- Control bar: Start / Stop / Reload ---
+        control_frame = ttk.Frame(root, padding=5)
+        control_frame.pack(fill=tk.X)
+
         self._start_btn = ttk.Button(
             control_frame, text="▶ Start", command=self._start_capture
         )
@@ -119,6 +147,11 @@ class TranscriberApp:
             control_frame, text="■ Stop", command=self._stop_capture, state=tk.DISABLED
         )
         self._stop_btn.pack(side=tk.LEFT, padx=2)
+
+        self._reload_btn = ttk.Button(
+            control_frame, text="⟳ Reload Config", command=self._reload_config
+        )
+        self._reload_btn.pack(side=tk.LEFT, padx=(15, 2))
 
         # --- Options bar ---
         options_frame = ttk.Frame(root, padding=5)
@@ -142,6 +175,21 @@ class TranscriberApp:
             command=self._toggle_autosave,
         )
         self._autosave_check.pack(side=tk.LEFT, padx=(0, 15))
+
+        # Japanese transcription toggle
+        self._jp_transcription_var = tk.BooleanVar(
+            value=self._config.japanese_transcription_enabled
+        )
+        self._jp_transcription_check = ttk.Checkbutton(
+            options_frame,
+            text="JP文字起こし",
+            variable=self._jp_transcription_var,
+        )
+        self._jp_transcription_check.pack(side=tk.LEFT, padx=(0, 15))
+        # Disable if using English-only model (no language detection)
+        if self._config.whisper_model.endswith(".en"):
+            self._jp_transcription_check.config(state=tk.DISABLED)
+            self._jp_transcription_var.set(False)
 
         # Model info
         self._model_label = ttk.Label(
@@ -175,6 +223,16 @@ class TranscriberApp:
         self._text_display.tag_configure("en_text", foreground="#d4d4d4")
         self._text_display.tag_configure("ja_label", foreground="#c586c0")
         self._text_display.tag_configure("ja_text", foreground="#ce9178")
+        # Mic-specific tags (cyan tones for contrast)
+        self._text_display.tag_configure("mic_label", foreground="#4ec9b0")
+        self._text_display.tag_configure("mic_text", foreground="#9cdcfe")
+        self._text_display.tag_configure("mic_ja_label", foreground="#c586c0")
+        self._text_display.tag_configure("mic_ja_text", foreground="#ce9178")
+        # JP language tags
+        self._text_display.tag_configure("jp_label", foreground="#dcdcaa")
+        self._text_display.tag_configure("jp_text", foreground="#d4d4d4")
+        self._text_display.tag_configure("mic_jp_label", foreground="#dcdcaa")
+        self._text_display.tag_configure("mic_jp_text", foreground="#9cdcfe")
         self._text_display.tag_configure("system", foreground="#808080", font=("Consolas", 10, "italic"))
 
         # --- Status bar ---
@@ -211,45 +269,100 @@ class TranscriberApp:
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _refresh_devices(self) -> None:
-        """Refresh the audio device list."""
+        """Refresh both output and microphone device lists."""
         self._append_system_message("Scanning audio devices...")
-        self._devices = self._audio_capture.get_devices()
 
-        device_names = [str(d) for d in self._devices]
-        self._device_combo["values"] = device_names
+        # Get all devices via the output capture instance (shares the same backend)
+        all_devices = self._audio_capture_output.get_devices()
 
-        if device_names:
-            # Try to select the default device from config
-            # Default to last device (typically a Loopback device)
-            default_idx = len(device_names) - 1
-            if self._config.default_device:
-                for i, d in enumerate(self._devices):
-                    if self._config.default_device.lower() in d.name.lower():
-                        default_idx = i
-                        break
+        # Split into output (loopback) and input (microphone) devices
+        self._output_devices = [
+            d for d in all_devices
+            if d.is_loopback or (d.max_output_channels > 0 and d.max_input_channels == 0)
+        ]
+        self._input_devices = [
+            d for d in all_devices
+            if d.max_input_channels > 0 and not d.is_loopback
+        ]
 
-            self._device_combo.current(default_idx)
-            self._append_system_message(
-                f"Found {len(self._devices)} audio device(s). "
-                f"Selected: {self._devices[default_idx].name}"
-            )
+        # Populate output device combo
+        output_names = [self._disabled_label] + [str(d) for d in self._output_devices]
+        self._output_device_combo["values"] = output_names
+
+        # Try to select default output device from config
+        output_idx = 0  # default to disabled
+        if self._config.default_device:
+            for i, d in enumerate(self._output_devices):
+                if self._config.default_device.lower() in d.name.lower():
+                    output_idx = i + 1  # +1 because of disabled label at index 0
+                    break
+        elif self._output_devices:
+            output_idx = len(output_names) - 1  # last device (typically loopback)
+        self._output_device_combo.current(output_idx)
+
+        # Populate mic device combo
+        mic_names = [self._disabled_label] + [str(d) for d in self._input_devices]
+        self._mic_device_combo["values"] = mic_names
+
+        # Try to select default mic device from config
+        mic_idx = 0  # default to disabled
+        if self._config.mic_device:
+            for i, d in enumerate(self._input_devices):
+                if self._config.mic_device.lower() in d.name.lower():
+                    mic_idx = i + 1
+                    break
+        self._mic_device_combo.current(mic_idx)
+
+        self._update_start_btn_state()
+
+        total = len(self._output_devices) + len(self._input_devices)
+        self._append_system_message(
+            f"Found {len(self._output_devices)} output device(s), "
+            f"{len(self._input_devices)} input device(s)."
+        )
+
+    def _update_start_btn_state(self) -> None:
+        """Enable Start button only if at least one device is selected."""
+        if self._is_recording:
+            return
+        output_selected = self._output_device_var.get() != self._disabled_label
+        mic_selected = self._mic_device_var.get() != self._disabled_label
+        if output_selected or mic_selected:
+            self._start_btn.config(state=tk.NORMAL)
         else:
-            self._append_system_message(
-                "No audio devices found. Please check your audio settings."
-            )
+            self._start_btn.config(state=tk.DISABLED)
 
     def _start_capture(self) -> None:
         """Start audio capture and processing pipeline."""
         if self._is_recording:
             return
 
-        # Get selected device
-        idx = self._device_combo.current()
-        if idx < 0 or idx >= len(self._devices):
-            messagebox.showerror("Error", "Please select an audio device.")
+        # Determine selected devices
+        output_sel = self._output_device_var.get()
+        mic_sel = self._mic_device_var.get()
+        use_output = output_sel != self._disabled_label
+        use_mic = mic_sel != self._disabled_label
+
+        if not use_output and not use_mic:
+            messagebox.showerror("Error", "少なくとも1つのデバイスを選択してください。")
             return
 
-        device = self._devices[idx]
+        output_device: AudioDevice | None = None
+        mic_device: AudioDevice | None = None
+
+        if use_output:
+            out_idx = self._output_device_combo.current() - 1  # -1 for disabled label
+            if 0 <= out_idx < len(self._output_devices):
+                output_device = self._output_devices[out_idx]
+
+        if use_mic:
+            mic_idx = self._mic_device_combo.current() - 1  # -1 for disabled label
+            if 0 <= mic_idx < len(self._input_devices):
+                mic_device = self._input_devices[mic_idx]
+
+        if not output_device and not mic_device:
+            messagebox.showerror("Error", "Please select a valid audio device.")
+            return
 
         # Check translation availability
         if self._translate_var.get() and not self._translator.is_available:
@@ -271,13 +384,20 @@ class TranscriberApp:
             self._drain_queue(self._display_queue)
 
             # Reset VAD state
-            self._vad.reset()
+            self._vad_output.reset()
+            self._vad_mic.reset()
 
             # Start stop event
             self._stop_event.clear()
 
-            # Start audio capture
-            self._audio_capture.start(device, self._audio_queue)
+            # Start audio capture(s)
+            started_sources = []
+            if output_device:
+                self._audio_capture_output.start(output_device, self._audio_queue)
+                started_sources.append(f"🔊 {output_device.name}")
+            if mic_device:
+                self._audio_capture_mic.start(mic_device, self._audio_queue)
+                started_sources.append(f"🎤 {mic_device.name}")
 
             # Start STT worker thread
             self._stt_thread = threading.Thread(
@@ -299,11 +419,15 @@ class TranscriberApp:
             self._is_recording = True
             self._start_btn.config(state=tk.DISABLED)
             self._stop_btn.config(state=tk.NORMAL)
-            self._device_combo.config(state=tk.DISABLED)
+            self._reload_btn.config(state=tk.DISABLED)
+            self._output_device_combo.config(state=tk.DISABLED)
+            self._mic_device_combo.config(state=tk.DISABLED)
             self._status_indicator.config(text="🔴")
             self._status_label.config(text=" Recording...")
 
-            self._append_system_message(f"Recording started: {device.name}")
+            self._append_system_message(
+                f"Recording started: {', '.join(started_sources)}"
+            )
 
             # Start polling for results
             self._poll_results()
@@ -316,7 +440,8 @@ class TranscriberApp:
     def _cleanup_capture(self) -> None:
         """Force-cleanup capture resources regardless of state."""
         self._stop_event.set()
-        self._audio_capture.stop()
+        self._audio_capture_output.stop()
+        self._audio_capture_mic.stop()
 
         if self._stt_thread and self._stt_thread.is_alive():
             self._stt_thread.join(timeout=3.0)
@@ -326,9 +451,12 @@ class TranscriberApp:
         self._is_recording = False
         self._start_btn.config(state=tk.NORMAL)
         self._stop_btn.config(state=tk.DISABLED)
-        self._device_combo.config(state="readonly")
+        self._reload_btn.config(state=tk.NORMAL)
+        self._output_device_combo.config(state="readonly")
+        self._mic_device_combo.config(state="readonly")
         self._status_indicator.config(text="⏹")
         self._status_label.config(text=" Stopped")
+        self._update_start_btn_state()
 
     def _stop_capture(self) -> None:
         """Stop audio capture and processing pipeline."""
@@ -340,8 +468,9 @@ class TranscriberApp:
         # Signal threads to stop
         self._stop_event.set()
 
-        # Stop audio capture
-        self._audio_capture.stop()
+        # Stop audio capture(s)
+        self._audio_capture_output.stop()
+        self._audio_capture_mic.stop()
 
         # Wait for threads to finish (with timeout)
         if self._stt_thread and self._stt_thread.is_alive():
@@ -353,57 +482,74 @@ class TranscriberApp:
         self._is_recording = False
         self._start_btn.config(state=tk.NORMAL)
         self._stop_btn.config(state=tk.DISABLED)
-        self._device_combo.config(state="readonly")
+        self._reload_btn.config(state=tk.NORMAL)
+        self._output_device_combo.config(state="readonly")
+        self._mic_device_combo.config(state="readonly")
         self._status_indicator.config(text="⏹")
         self._status_label.config(text=" Stopped")
+        self._update_start_btn_state()
 
         self._append_system_message("Recording stopped.")
 
     def _stt_worker(self) -> None:
         """Background thread: VAD + Whisper transcription.
 
-        Reads audio chunks from the audio queue, runs VAD, and
-        transcribes completed utterances.
+        Reads (source_tag, audio_chunk) tuples from the audio queue,
+        dispatches to the corresponding per-source VAD instance,
+        and transcribes completed utterances.
         """
         logger.info("STT worker started")
+
+        vad_map = {
+            "output": self._vad_output,
+            "mic": self._vad_mic,
+        }
 
         while not self._stop_event.is_set():
             try:
                 # Get audio chunk (blocking with timeout)
                 try:
-                    audio_chunk = self._audio_queue.get(timeout=0.5)
+                    source_tag, audio_chunk = self._audio_queue.get(timeout=0.5)
                 except queue.Empty:
                     continue
 
+                # Select VAD instance for this source
+                vad = vad_map.get(source_tag, self._vad_output)
+
                 # Run VAD
-                utterances = self._vad.process_chunk(audio_chunk)
+                utterances = vad.process_chunk(audio_chunk)
 
                 # Transcribe completed utterances
-                self._transcribe_utterances(utterances)
+                self._transcribe_utterances(utterances, source_tag)
 
             except Exception:
                 logger.exception("Error in STT worker")
 
-        # Flush remaining audio in VAD buffer before exiting
+        # Flush remaining audio in both VAD buffers before exiting
         logger.info("STT worker flushing remaining audio...")
-        remaining = self._vad.flush_remaining()
-        if remaining is not None:
-            self._transcribe_utterances([remaining])
+        for tag, vad in vad_map.items():
+            remaining = vad.flush_remaining()
+            if remaining is not None:
+                self._transcribe_utterances([remaining], tag)
 
         logger.info("STT worker stopped")
 
-    def _transcribe_utterances(self, utterances: list[np.ndarray]) -> None:
+    def _transcribe_utterances(
+        self, utterances: list[np.ndarray], source: str = "output"
+    ) -> None:
         """Transcribe a list of audio utterances and queue results.
 
-        Non-English audio is detected and skipped with a log message.
+        Applies language filter based on the JP transcription toggle.
         """
         for utterance in utterances:
             result: TranscribeResult = self._transcriber.transcribe(utterance)
             if not result.text:
                 continue
 
-            # Skip non-English audio (multilingual model only)
-            if result.language and result.language != "en":
+            detected_lang = result.language or "en"
+
+            # Language filtering (multilingual model only)
+            if detected_lang != "en" and not self._jp_transcription_var.get():
                 logger.info(
                     "Skipped non-English audio (detected: %s, prob=%.2f): %s",
                     result.language,
@@ -415,6 +561,8 @@ class TranscriberApp:
             entry = TranscriptEntry(
                 timestamp=datetime.now(),
                 english_text=result.text,
+                source=source,
+                language=detected_lang,
             )
             try:
                 self._text_queue.put(entry, timeout=1.0)
@@ -424,8 +572,9 @@ class TranscriberApp:
     def _translation_worker(self) -> None:
         """Background thread: translates English text to Japanese.
 
-        Reads TranscriptEntry from the text queue, translates if enabled,
-        and puts results in the display queue.
+        Reads TranscriptEntry from the text queue, translates if enabled
+        and the entry is in English, and puts results in the display queue.
+        Non-English entries (e.g. Japanese) pass through without translation.
         """
         logger.info("Translation worker started")
 
@@ -437,8 +586,12 @@ class TranscriberApp:
                 except queue.Empty:
                     continue
 
-                # Translate if enabled
-                if self._translate_var.get() and self._translator.is_available:
+                # Only translate English entries
+                if (
+                    entry.language == "en"
+                    and self._translate_var.get()
+                    and self._translator.is_available
+                ):
                     japanese = self._translator.translate(entry.english_text)
                     entry.japanese_text = japanese
 
@@ -487,21 +640,48 @@ class TranscriberApp:
             self._root.after(POLL_INTERVAL_MS, self._poll_results)
 
     def _display_entry(self, entry: TranscriptEntry) -> None:
-        """Display a transcript entry in the text widget."""
+        """Display a transcript entry in the text widget with source/language styling."""
         self._text_display.config(state=tk.NORMAL)
 
         ts = entry.timestamp.strftime("%H:%M:%S")
+        is_mic = entry.source == "mic"
+        source_icon = "🎤" if is_mic else "🔊"
+        lang_label = entry.language.upper() if entry.language else "EN"
 
-        # English line
+        # Choose tag sets based on source
+        if is_mic:
+            # Mic source uses cyan-toned tags
+            if lang_label == "EN":
+                main_label_tag = "mic_label"
+                main_text_tag = "mic_text"
+            else:
+                main_label_tag = "mic_jp_label"
+                main_text_tag = "mic_jp_text"
+            ja_label_tag = "mic_ja_label"
+            ja_text_tag = "mic_ja_text"
+        else:
+            # Output source uses standard tags
+            if lang_label == "EN":
+                main_label_tag = "en_label"
+                main_text_tag = "en_text"
+            else:
+                main_label_tag = "jp_label"
+                main_text_tag = "jp_text"
+            ja_label_tag = "ja_label"
+            ja_text_tag = "ja_text"
+
+        # Main text line
         self._text_display.insert(tk.END, f"[{ts}] ", "timestamp")
-        self._text_display.insert(tk.END, "EN: ", "en_label")
-        self._text_display.insert(tk.END, f"{entry.english_text}\n", "en_text")
+        self._text_display.insert(tk.END, f"{source_icon} ", "timestamp")
+        self._text_display.insert(tk.END, f"{lang_label}: ", main_label_tag)
+        self._text_display.insert(tk.END, f"{entry.english_text}\n", main_text_tag)
 
-        # Japanese line (if available)
+        # Japanese translation line (if available, only for EN entries)
         if entry.japanese_text:
             self._text_display.insert(tk.END, f"[{ts}] ", "timestamp")
-            self._text_display.insert(tk.END, "JA: ", "ja_label")
-            self._text_display.insert(tk.END, f"{entry.japanese_text}\n", "ja_text")
+            self._text_display.insert(tk.END, f"{source_icon} ", "timestamp")
+            self._text_display.insert(tk.END, "JA: ", ja_label_tag)
+            self._text_display.insert(tk.END, f"{entry.japanese_text}\n", ja_text_tag)
 
         self._text_display.insert(tk.END, "\n")
 
@@ -592,6 +772,74 @@ class TranscriberApp:
 
         self._file_exporter.stop_auto_save()
         self._root.destroy()
+
+    def _reload_config(self) -> None:
+        """Reload config.yaml and apply changes to components.
+
+        Only available when recording is stopped.
+        """
+        if self._is_recording:
+            self._append_system_message("⚠ 録音中は設定リロードできません。先に停止してください。")
+            return
+
+        changes = self._config.reload()
+
+        if not changes:
+            self._append_system_message("設定を再読み込みしました（変更なし）。")
+            return
+
+        # Apply changes to components
+        if "whisper_model" in changes or "compute_type" in changes:
+            self._transcriber = Transcriber(
+                model_size=self._config.whisper_model,
+                compute_type=self._config.compute_type,
+            )
+            self._model_label.config(text=f"Model: {self._config.whisper_model}")
+
+            # Update JP transcription checkbox state based on model type
+            if self._config.whisper_model.endswith(".en"):
+                self._jp_transcription_check.config(state=tk.DISABLED)
+                self._jp_transcription_var.set(False)
+            else:
+                self._jp_transcription_check.config(state=tk.NORMAL)
+
+        if "deepl_api_key" in changes:
+            self._translator = Translator(api_key=self._config.deepl_api_key)
+
+        if any(k in changes for k in ("vad_threshold", "max_speech_duration", "min_speech_ms")):
+            self._vad_output = VoiceActivityDetector(
+                threshold=self._config.vad_threshold,
+                min_speech_ms=self._config.min_speech_ms,
+                max_speech_s=self._config.max_speech_duration,
+            )
+            self._vad_mic = VoiceActivityDetector(
+                threshold=self._config.vad_threshold,
+                min_speech_ms=self._config.min_speech_ms,
+                max_speech_s=self._config.max_speech_duration,
+            )
+
+        if "translation_enabled" in changes:
+            self._translate_var.set(self._config.translation_enabled)
+
+        if "japanese_transcription_enabled" in changes:
+            if not self._config.whisper_model.endswith(".en"):
+                self._jp_transcription_var.set(self._config.japanese_transcription_enabled)
+
+        if "default_device" in changes or "mic_device" in changes:
+            self._refresh_devices()
+
+        # Display summary of changes
+        change_lines = []
+        for key, (old, new) in changes.items():
+            if key == "deepl_api_key":
+                change_lines.append(f"  {key}: (hidden) → (hidden)")
+            else:
+                change_lines.append(f"  {key}: {old} → {new}")
+        self._append_system_message(
+            f"設定を再読み込みしました（{len(changes)}件変更）:"
+        )
+        for line in change_lines:
+            self._append_system_message(line)
 
     def run(self) -> None:
         """Start the application main loop."""

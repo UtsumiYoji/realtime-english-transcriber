@@ -28,9 +28,11 @@ class AppConfig:
     translation_enabled: bool = True
     auto_save_path: str = ""
     default_device: str = ""
+    mic_device: str = ""
     vad_threshold: float = 0.5
     max_speech_duration: float = 30.0
     min_speech_ms: int = 250
+    japanese_transcription_enabled: bool = False
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> AppConfig:
@@ -79,9 +81,11 @@ class AppConfig:
             "translation_enabled": self.translation_enabled,
             "auto_save_path": self.auto_save_path,
             "default_device": self.default_device,
+            "mic_device": self.mic_device,
             "vad_threshold": self.vad_threshold,
             "max_speech_duration": self.max_speech_duration,
             "min_speech_ms": self.min_speech_ms,
+            "japanese_transcription_enabled": self.japanese_transcription_enabled,
         }
         try:
             config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -127,3 +131,53 @@ class AppConfig:
             )
 
         return warnings
+
+    def reload(self, path: str | Path | None = None) -> dict[str, tuple]:
+        """Reload configuration from YAML file and return changed fields.
+
+        Returns a dict of {field_name: (old_value, new_value)} for fields that changed.
+        Environment variable overrides are applied after file reload.
+        """
+        config_path = Path(path) if path else _DEFAULT_CONFIG_PATH
+        changes: dict[str, tuple] = {}
+
+        if not config_path.exists():
+            logger.warning("Config file not found at %s, skipping reload", config_path)
+            return changes
+
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+        except Exception:
+            logger.exception("Failed to reload config from %s", config_path)
+            return changes
+
+        for key, new_value in data.items():
+            if not hasattr(self, key):
+                logger.warning("Unknown config key during reload: %s", key)
+                continue
+            old_value = getattr(self, key)
+            if old_value != new_value:
+                setattr(self, key, new_value)
+                changes[key] = (old_value, new_value)
+                logger.info("Config reloaded: %s: %r -> %r", key, old_value, new_value)
+
+        # Environment variable overrides
+        env_api_key = os.environ.get("DEEPL_API_KEY")
+        if env_api_key and env_api_key != self.deepl_api_key:
+            old = self.deepl_api_key
+            self.deepl_api_key = env_api_key
+            changes["deepl_api_key"] = (old, env_api_key)
+
+        env_model = os.environ.get("WHISPER_MODEL")
+        if env_model and env_model != self.whisper_model:
+            old = self.whisper_model
+            self.whisper_model = env_model
+            changes["whisper_model"] = (old, env_model)
+
+        if changes:
+            logger.info("Config reload complete: %d field(s) changed", len(changes))
+        else:
+            logger.info("Config reload complete: no changes detected")
+
+        return changes

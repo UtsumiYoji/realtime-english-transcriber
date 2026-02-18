@@ -20,13 +20,17 @@ class TranscriptEntry:
     timestamp: datetime
     english_text: str
     japanese_text: str | None = None
+    source: str = "output"  # "output" or "mic"
+    language: str = "en"    # detected language code (e.g. "en", "ja")
 
     def format_text(self, include_japanese: bool = True) -> str:
         """Format entry as a display/save string."""
         ts = self.timestamp.strftime("%H:%M:%S")
-        lines = [f"[{ts}] EN: {self.english_text}"]
+        source_icon = "\U0001f50a" if self.source == "output" else "\U0001f3a4"
+        lang_label = self.language.upper()
+        lines = [f"[{ts}] {source_icon} {lang_label}: {self.english_text}"]
         if include_japanese and self.japanese_text:
-            lines.append(f"[{ts}] JA: {self.japanese_text}")
+            lines.append(f"[{ts}] {source_icon} JA: {self.japanese_text}")
         return "\n".join(lines)
 
 
