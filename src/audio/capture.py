@@ -40,24 +40,29 @@ class AudioDevice:
 
 
 class AudioCapture:
-    """Captures audio from WASAPI loopback devices.
+    """Captures audio from WASAPI loopback or input devices.
 
     Uses PyAudioWPatch as primary (reliable WASAPI loopback support),
     with sounddevice as fallback.
 
+    Each instance carries a source_tag that is prepended to queue entries
+    as (source_tag, chunk) tuples, allowing downstream consumers to
+    distinguish between multiple audio sources.
+
     Usage:
-        capture = AudioCapture()
+        capture = AudioCapture(source_tag="output")
         devices = capture.get_devices()
         capture.start(device_index, audio_queue)
-        ...
+        ...  # audio_queue receives ("output", np.ndarray) tuples
         capture.stop()
     """
 
-    def __init__(self) -> None:
+    def __init__(self, source_tag: str = "output") -> None:
         self._stream: Any = None
         self._running = False
         self._lock = threading.Lock()
         self._backend: str = ""
+        self.source_tag = source_tag
 
     def get_devices(self) -> list[AudioDevice]:
         """Get list of available audio devices with loopback support.
@@ -74,6 +79,28 @@ class AudioCapture:
 
         logger.info("PyAudioWPatch unavailable, falling back to sounddevice")
         return self._get_devices_sounddevice()
+
+    def get_output_devices(self) -> list[AudioDevice]:
+        """Get list of output (loopback) audio devices.
+
+        Returns devices that can capture system audio output.
+        With PyAudioWPatch, these are flagged as loopback devices.
+        With sounddevice, output devices (max_output_channels > 0) are returned.
+        """
+        return [
+            d for d in self.get_devices()
+            if d.is_loopback or (d.max_output_channels > 0 and d.max_input_channels == 0)
+        ]
+
+    def get_input_devices(self) -> list[AudioDevice]:
+        """Get list of input (microphone) audio devices.
+
+        Returns devices that can capture microphone / line-in audio.
+        """
+        return [
+            d for d in self.get_devices()
+            if d.max_input_channels > 0 and not d.is_loopback
+        ]
 
     def _get_devices_pyaudiowpatch(self) -> list[AudioDevice]:
         """Enumerate devices using PyAudioWPatch (WASAPI loopback support)."""
@@ -183,11 +210,11 @@ class AudioCapture:
         """Start capturing audio from the specified device.
 
         Captured audio is resampled to 16kHz mono float32 and pushed
-        to the provided queue as numpy arrays.
+        to the provided queue as (source_tag, np.ndarray) tuples.
 
         Args:
             device: AudioDevice to capture from.
-            audio_queue: Queue to receive audio chunks (np.ndarray, float32, 16kHz mono).
+            audio_queue: Queue to receive (source_tag, chunk) tuples.
         """
         with self._lock:
             if self._running:
@@ -252,7 +279,7 @@ class AudioCapture:
                     down = sample_rate // g
                     audio_data = resample_poly(audio_data, up, down).astype(np.float32)
 
-                audio_queue.put(audio_data)
+                audio_queue.put((self.source_tag, audio_data))
             except Exception:
                 logger.exception("Error in audio callback")
 
@@ -305,7 +332,7 @@ class AudioCapture:
                     down = sample_rate // g
                     audio_data = resample_poly(audio_data, up, down).astype(np.float32)
 
-                audio_queue.put(audio_data)
+                audio_queue.put((self.source_tag, audio_data))
             except Exception:
                 logger.exception("Error in audio callback")
 

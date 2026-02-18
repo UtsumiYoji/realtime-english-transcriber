@@ -19,6 +19,9 @@ auto_save_path: ""
 # Default audio device name (empty = system default)
 default_device: ""
 
+# Default microphone device name (empty = disabled)
+mic_device: ""
+
 # VAD sensitivity threshold (0.0 - 1.0, higher = stricter)
 vad_threshold: 0.5
 
@@ -27,3 +30,7 @@ max_speech_duration: 30.0
 
 # Minimum speech duration to process (milliseconds)
 min_speech_ms: 250
+
+# Enable Japanese transcription (only with multilingual models)
+# When false, non-English audio is skipped (default behavior)
+japanese_transcription_enabled: false
