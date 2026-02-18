@@ -86,6 +86,10 @@ class TranscriberApp:
         self._entries: list[TranscriptEntry] = []
         self._is_recording = False
 
+        # Thread-safe settings for worker threads (plain booleans, read atomically)
+        self._translate_enabled = False
+        self._jp_transcription_enabled = False
+
         # Build GUI
         self._root = tk.Tk()
         self._build_ui()
@@ -272,18 +276,9 @@ class TranscriberApp:
         """Refresh both output and microphone device lists."""
         self._append_system_message("Scanning audio devices...")
 
-        # Get all devices via the output capture instance (shares the same backend)
-        all_devices = self._audio_capture_output.get_devices()
-
-        # Split into output (loopback) and input (microphone) devices
-        self._output_devices = [
-            d for d in all_devices
-            if d.is_loopback or (d.max_output_channels > 0 and d.max_input_channels == 0)
-        ]
-        self._input_devices = [
-            d for d in all_devices
-            if d.max_input_channels > 0 and not d.is_loopback
-        ]
+        # Query devices via the output capture instance (shares the same backend)
+        self._output_devices = self._audio_capture_output.get_output_devices()
+        self._input_devices = self._audio_capture_output.get_input_devices()
 
         # Populate output device combo
         output_names = [self._disabled_label] + [str(d) for d in self._output_devices]
@@ -344,7 +339,7 @@ class TranscriberApp:
         use_mic = mic_sel != self._disabled_label
 
         if not use_output and not use_mic:
-            messagebox.showerror("Error", "少なくとも1つのデバイスを選択してください。")
+            messagebox.showerror("Error", "Please select at least one audio device.")
             return
 
         output_device: AudioDevice | None = None
@@ -389,6 +384,10 @@ class TranscriberApp:
 
             # Start stop event
             self._stop_event.clear()
+
+            # Snapshot GUI settings for thread-safe access in workers
+            self._translate_enabled = self._translate_var.get()
+            self._jp_transcription_enabled = self._jp_transcription_var.get()
 
             # Start audio capture(s)
             started_sources = []
@@ -549,7 +548,7 @@ class TranscriberApp:
             detected_lang = result.language or "en"
 
             # Language filtering (multilingual model only)
-            if detected_lang != "en" and not self._jp_transcription_var.get():
+            if detected_lang != "en" and not self._jp_transcription_enabled:
                 logger.info(
                     "Skipped non-English audio (detected: %s, prob=%.2f): %s",
                     result.language,
@@ -560,7 +559,7 @@ class TranscriberApp:
 
             entry = TranscriptEntry(
                 timestamp=datetime.now(),
-                english_text=result.text,
+                text=result.text,
                 source=source,
                 language=detected_lang,
             )
@@ -589,11 +588,11 @@ class TranscriberApp:
                 # Only translate English entries
                 if (
                     entry.language == "en"
-                    and self._translate_var.get()
+                    and self._translate_enabled
                     and self._translator.is_available
                 ):
-                    japanese = self._translator.translate(entry.english_text)
-                    entry.japanese_text = japanese
+                    translation = self._translator.translate(entry.text)
+                    entry.translation = translation
 
                 # Put in display queue
                 try:
@@ -625,7 +624,7 @@ class TranscriberApp:
                 # Auto-save
                 if self._autosave_var.get() and self._file_exporter.is_auto_saving:
                     self._file_exporter.append_entry(
-                        entry, include_japanese=self._translate_var.get()
+                        entry, include_translation=self._translate_var.get()
                     )
 
                 processed += 1
@@ -674,14 +673,14 @@ class TranscriberApp:
         self._text_display.insert(tk.END, f"[{ts}] ", "timestamp")
         self._text_display.insert(tk.END, f"{source_icon} ", "timestamp")
         self._text_display.insert(tk.END, f"{lang_label}: ", main_label_tag)
-        self._text_display.insert(tk.END, f"{entry.english_text}\n", main_text_tag)
+        self._text_display.insert(tk.END, f"{entry.text}\n", main_text_tag)
 
-        # Japanese translation line (if available, only for EN entries)
-        if entry.japanese_text:
+        # Translation line (if available, only for EN entries)
+        if entry.translation:
             self._text_display.insert(tk.END, f"[{ts}] ", "timestamp")
             self._text_display.insert(tk.END, f"{source_icon} ", "timestamp")
             self._text_display.insert(tk.END, "JA: ", ja_label_tag)
-            self._text_display.insert(tk.END, f"{entry.japanese_text}\n", ja_text_tag)
+            self._text_display.insert(tk.END, f"{entry.translation}\n", ja_text_tag)
 
         self._text_display.insert(tk.END, "\n")
 
@@ -717,7 +716,7 @@ class TranscriberApp:
             self._file_exporter.save_transcript(
                 self._entries,
                 filepath,
-                include_japanese=self._translate_var.get(),
+                include_translation=self._translate_var.get(),
             )
             self._append_system_message(f"Transcript saved: {filepath}")
         except Exception as e:
@@ -783,6 +782,11 @@ class TranscriberApp:
             return
 
         changes = self._config.reload()
+
+        # Validate configuration after reload and show any warnings
+        warnings = self._config.validate()
+        for warning in warnings:
+            self._append_system_message(f"⚠ {warning}")
 
         if not changes:
             self._append_system_message("設定を再読み込みしました（変更なし）。")

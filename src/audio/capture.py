@@ -63,6 +63,7 @@ class AudioCapture:
         self._lock = threading.Lock()
         self._backend: str = ""
         self.source_tag = source_tag
+
     def get_devices(self) -> list[AudioDevice]:
         """Get list of available audio devices with loopback support.
 

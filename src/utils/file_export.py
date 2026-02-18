@@ -18,19 +18,19 @@ class TranscriptEntry:
     """A single transcript entry with timestamp and text."""
 
     timestamp: datetime
-    english_text: str
-    japanese_text: str | None = None
+    text: str
+    translation: str | None = None
     source: str = "output"  # "output" or "mic"
     language: str = "en"    # detected language code (e.g. "en", "ja")
 
-    def format_text(self, include_japanese: bool = True) -> str:
+    def format_text(self, include_translation: bool = True) -> str:
         """Format entry as a display/save string."""
         ts = self.timestamp.strftime("%H:%M:%S")
         source_icon = "\U0001f50a" if self.source == "output" else "\U0001f3a4"
         lang_label = self.language.upper()
-        lines = [f"[{ts}] {source_icon} {lang_label}: {self.english_text}"]
-        if include_japanese and self.japanese_text:
-            lines.append(f"[{ts}] {source_icon} JA: {self.japanese_text}")
+        lines = [f"[{ts}] {source_icon} {lang_label}: {self.text}"]
+        if include_translation and self.translation:
+            lines.append(f"[{ts}] {source_icon} JA: {self.translation}")
         return "\n".join(lines)
 
 
@@ -50,14 +50,14 @@ class FileExporter:
         self,
         entries: list[TranscriptEntry],
         filepath: str | Path,
-        include_japanese: bool = True,
+        include_translation: bool = True,
     ) -> None:
         """Save all transcript entries to a file.
 
         Args:
             entries: List of transcript entries to save.
             filepath: Output file path.
-            include_japanese: Whether to include Japanese translations.
+            include_translation: Whether to include translations.
         """
         filepath = Path(filepath)
         try:
@@ -66,7 +66,7 @@ class FileExporter:
                 f.write(f"# Transcript - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write(f"# Entries: {len(entries)}\n\n")
                 for entry in entries:
-                    f.write(entry.format_text(include_japanese) + "\n\n")
+                    f.write(entry.format_text(include_translation) + "\n\n")
             logger.info("Transcript saved to %s (%d entries)", filepath, len(entries))
         except Exception:
             logger.exception("Failed to save transcript to %s", filepath)
@@ -98,18 +98,18 @@ class FileExporter:
             self._auto_save_path = None
             raise
 
-    def append_entry(self, entry: TranscriptEntry, include_japanese: bool = True) -> None:
+    def append_entry(self, entry: TranscriptEntry, include_translation: bool = True) -> None:
         """Append a single entry to the auto-save file.
 
         Args:
             entry: Transcript entry to append.
-            include_japanese: Whether to include Japanese translation.
+            include_translation: Whether to include translation.
         """
         if self._auto_save_file is None:
             return
 
         try:
-            self._auto_save_file.write(entry.format_text(include_japanese) + "\n\n")
+            self._auto_save_file.write(entry.format_text(include_translation) + "\n\n")
             self._auto_save_file.flush()
         except Exception:
             logger.exception("Failed to append entry to auto-save file")
